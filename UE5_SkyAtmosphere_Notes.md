@@ -346,14 +346,18 @@ if (Discriminant >= -1e-6)  // Allow tiny negative for numerical stability
 
 #### Option 4: Use Radius Safety Margin
 
-```hlsl
-// SkyAtmosphere.usf around line 450
-// In IntegrateSingleScatteredLuminance(), sphere intersection calls
+In `IntegrateSingleScatteredLuminance()`, find existing `RayIntersectSphere` calls that use `BottomRadiusKm` and multiply by the safety constant:
 
-// Add safety margin to sphere radius:
-float2 SolB = RayIntersectSphere(WorldPos, WorldDir,
-    float4(PlanetO, Atmosphere.BottomRadiusKm * PLANET_RADIUS_RATIO_SAFE_EDGE));
+```hlsl
+// SkyAtmosphere.usf line ~450
+// Find:
+float2 SolB = RayIntersectSphere(WorldPos, WorldDir, float4(PlanetO, Atmosphere.BottomRadiusKm));
+
+// Replace with:
+float2 SolB = RayIntersectSphere(WorldPos, WorldDir, float4(PlanetO, Atmosphere.BottomRadiusKm * PLANET_RADIUS_RATIO_SAFE_EDGE));
 ```
+
+This adds ~10m safety margin at Earth scale to prevent grazing ray misses.
 
 ### C++ Fixes (SkyAtmosphereRendering.cpp)
 

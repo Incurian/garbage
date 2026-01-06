@@ -69,44 +69,121 @@ Shader file: `/Engine/Private/SkyAtmosphere.usf`
 
 ### Depth Buffer Integration
 
-For opaque geometry, the ray marcher reads the depth buffer to limit ray distance. This is where edge artifacts originate:
+For opaque geometry, the ray marcher reads the depth buffer to limit ray distance. This is where edge artifacts originate.
+
+**Function:** `IntegrateSingleScatteredLuminance()` (SkyAtmosphere.usf:399)
 
 ```hlsl
-// SkyAtmosphere.usf lines 491-512 (UE 5.6)
-if (DeviceZ != FarDepthValue)
-{
-    const float3 DepthBufferTranslatedWorldPosKm = GetScreenTranslatedWorldPos(SVPos, DeviceZ).xyz * CM_TO_SKY_UNIT;
-    const float3 TraceStartTranslatedWorldPosKm = WorldPos + View.SkyPlanetTranslatedWorldCenterAndViewHeight.xyz * CM_TO_SKY_UNIT;
-    const float3 TraceStartToSurfaceWorldKm = DepthBufferTranslatedWorldPosKm - TraceStartTranslatedWorldPosKm;
-    float tDepth = length(TraceStartToSurfaceWorldKm);  // Issue 1: length() includes perpendicular error
-    if (tDepth < tMax)
-    {
-        tMax = tDepth;
-    }
+// SkyAtmosphere.usf lines 491-512
+// Inside IntegrateSingleScatteredLuminance(), within #if VIEWDATA_AVAILABLE block
 
-    if (dot(WorldDir, TraceStartToSurfaceWorldKm) < 0.0)  // Issue 2: No epsilon tolerance
+float PlanetOnOpaque = 1.0f;  // This is used to hide opaque meshes under the planet ground
+#if VIEWDATA_AVAILABLE
+#if SAMPLE_ATMOSPHERE_ON_CLOUDS
+    // ... cloud path uses DeviceZ directly as world distance ...
+#else // SAMPLE_ATMOSPHERE_ON_CLOUDS
+    if (DeviceZ != FarDepthValue)
     {
-        return Result;  // Early exit with zero luminance - causes dark edges
+        const float3 DepthBufferTranslatedWorldPosKm = GetScreenTranslatedWorldPos(SVPos, DeviceZ).xyz * CM_TO_SKY_UNIT;
+        const float3 TraceStartTranslatedWorldPosKm = WorldPos + View.SkyPlanetTranslatedWorldCenterAndViewHeight.xyz * CM_TO_SKY_UNIT;
+        const float3 TraceStartToSurfaceWorldKm = DepthBufferTranslatedWorldPosKm - TraceStartTranslatedWorldPosKm;
+        float tDepth = length(TraceStartToSurfaceWorldKm);  // Line 496 - Issue: length() includes perpendicular error
+        if (tDepth < tMax)
+        {
+            tMax = tDepth;
+        }
+        else
+        {
+            // Artists did not like that we handle automatic hiding of opaque element behind the planet.
+            // Now, pixel under the surface of earht will receive aerial perspective as if they were on the ground.
+            //PlanetOnOpaque = 0.0;
+        }
+
+        // if the ray intersects with the atmosphere boundary, make sure we do not apply atmosphere on surfaces are front of it.
+        if (dot(WorldDir, TraceStartToSurfaceWorldKm) < 0.0)  // Line 509 - Issue: No epsilon tolerance
+        {
+            return Result;  // Early exit with zero luminance - causes dark edges
+        }
     }
+#endif // SAMPLE_ATMOSPHERE_ON_CLOUDS
+#endif
+```
+
+### Helper Function: GetScreenTranslatedWorldPos
+
+**Function:** `GetScreenTranslatedWorldPos()` (SkyAtmosphere.usf:161)
+
+```hlsl
+// SkyAtmosphere.usf lines 161-167
+float4 GetScreenTranslatedWorldPos(float4 SVPos, float DeviceZ)
+{
+#if HAS_INVERTED_Z_BUFFER
+    DeviceZ = max(0.000000000001, DeviceZ);  // TODO: investigate why SvPositionToWorld returns bad values when DeviceZ is far=0 when using inverted z
+#endif
+    return float4(SvPositionToTranslatedWorld(float4(SVPos.xy, DeviceZ, 1.0)), 1.0);
 }
 ```
 
 ### Ray-Sphere Intersection
 
-The `RayIntersectSphere` function in `Common.ush` uses standard quadratic formula:
+**Function:** `RayIntersectSphere()` (Common.ush:1952)
 
 ```hlsl
-float Discriminant = QuadraticCoef.y * QuadraticCoef.y - 4 * QuadraticCoef.x * QuadraticCoef.z;
-if (Discriminant >= 0)  // No epsilon - vulnerable at grazing angles
+// Common.ush lines 1948-1975
+/**
+ * Returns near intersection in x, far intersection in y, or both -1 if no intersection.
+ * RayDirection does not need to be unit length.
+ */
+float2 RayIntersectSphere(float3 RayOrigin, float3 RayDirection, float4 Sphere)
 {
-    float SqrtDiscriminant = sqrt(Discriminant);
-    Intersections = (-QuadraticCoef.y + float2(-1, 1) * SqrtDiscriminant) / (2 * QuadraticCoef.x);
+    float3 LocalPosition = RayOrigin - Sphere.xyz;
+    float LocalPositionSqr = dot(LocalPosition, LocalPosition);
+
+    float3 QuadraticCoef;
+    QuadraticCoef.x = dot(RayDirection, RayDirection);
+    QuadraticCoef.y = 2 * dot(RayDirection, LocalPosition);
+    QuadraticCoef.z = LocalPositionSqr - Sphere.w * Sphere.w;
+
+    float Discriminant = QuadraticCoef.y * QuadraticCoef.y - 4 * QuadraticCoef.x * QuadraticCoef.z;
+
+    float2 Intersections = -1;
+
+    // Only continue if the ray intersects the sphere
+    FLATTEN
+    if (Discriminant >= 0)  // Line 1968 - Issue: No epsilon for near-zero cases (grazing rays)
+    {
+        float SqrtDiscriminant = sqrt(Discriminant);
+        Intersections = (-QuadraticCoef.y + float2(-1, 1) * SqrtDiscriminant) / (2 * QuadraticCoef.x);
+    }
+
+    return Intersections;
 }
 ```
 
-**Precision constants defined but underutilized:**
-- `PLANET_RADIUS_OFFSET = 0.001` (1 meter in km) - defined but not used in sphere intersection calls
-- `PLANET_RADIUS_RATIO_SAFE_EDGE = 1.00000155763` (~10m at Earth scale) - used for atmosphere entry, not depth tests
+### Precision Constants
+
+**File:** SkyAtmosphereCommon.ush (lines 24-30)
+
+```hlsl
+// Float accuracy offset in Sky unit (km, so this is 1m). Should match the one in FAtmosphereSetup::ComputeViewData
+#define PLANET_RADIUS_OFFSET 0.001f
+
+// Planet radius safe edge to make sure ray does intersect with the atmosphere, for it to traverse the atmosphere.
+// Must match the one in FSceneRenderer::RenderSkyAtmosphereInternal.
+// This is (0.01km/6420km).
+#define PLANET_RADIUS_RATIO_SAFE_EDGE 1.00000155763f
+```
+
+**Where these constants are actually used:**
+
+| Constant | Location | Usage |
+|----------|----------|-------|
+| `PLANET_RADIUS_OFFSET` | SkyAtmosphere.usf:192 | `MoveToTopAtmosphere()` - offset when entering atmosphere |
+| `PLANET_RADIUS_OFFSET` | SkyAtmosphere.usf:664 | `IntegrateSingleScatteredLuminance()` - planet shadow for light 0 |
+| `PLANET_RADIUS_OFFSET` | SkyAtmosphere.usf:702 | `IntegrateSingleScatteredLuminance()` - planet shadow for light 1 |
+| `PLANET_RADIUS_RATIO_SAFE_EDGE` | SkyAtmosphere.usf:955 | `RenderSkyAtmosphereRayMarchingPS()` - FastSky height check |
+
+**Note:** Neither constant is used in the depth buffer integration code where the edge artifacts occur.
 
 ## Physical Model
 
@@ -132,19 +209,32 @@ The system is optimized for ground-level views. When viewing a planet from space
 
 ### All Contributing Factors (Deep Dive Analysis)
 
-| Factor | Location | Issue |
-|--------|----------|-------|
-| **Dot check - no epsilon** | SkyAtmosphere.usf:509 | Strict `< 0.0` fails on FP noise at grazing angles |
-| **Length vs projected distance** | SkyAtmosphere.usf:496 | `length()` includes perpendicular error; `dot()` would be robust |
-| **Ray-sphere discriminant** | Common.ush:1968 | `>= 0` check with no epsilon for near-zero cases |
-| **Radius offset unused** | SkyAtmosphereCommon.ush:26 | `PLANET_RADIUS_OFFSET` defined but not used in sphere tests |
-| **Planar depth test** | SkyAtmosphereRendering.cpp | `StartDepthZ` computed from center ray, no curvature compensation |
-| **Inverted Z precision** | SkyAtmosphere.usf:~450 | Known issue: "bad values when DeviceZ is far=0" |
+| Factor | Function | File:Line | Code Context |
+|--------|----------|-----------|--------------|
+| **Dot check - no epsilon** | `IntegrateSingleScatteredLuminance()` | SkyAtmosphere.usf:509 | `if (dot(WorldDir, TraceStartToSurfaceWorldKm) < 0.0)` |
+| **Length vs projected distance** | `IntegrateSingleScatteredLuminance()` | SkyAtmosphere.usf:496 | `float tDepth = length(TraceStartToSurfaceWorldKm);` |
+| **Ray-sphere discriminant** | `RayIntersectSphere()` | Common.ush:1968 | `if (Discriminant >= 0)` |
+| **Radius offset unused** | (definition only) | SkyAtmosphereCommon.ush:24 | `#define PLANET_RADIUS_OFFSET 0.001f` |
+| **Planar depth test** | C++ renderer setup | SkyAtmosphereRendering.cpp | `StartDepthZ` from center ray |
+| **Inverted Z precision** | `GetScreenTranslatedWorldPos()` | SkyAtmosphere.usf:164 | `DeviceZ = max(0.000000000001, DeviceZ);` |
 
-**Epic's own TODOs acknowledge FP issues:**
+### Epic's Own TODOs Acknowledging FP Issues
+
+**TODO 1:** `GetScreenTranslatedWorldPos()` (SkyAtmosphere.usf:164)
 ```hlsl
-// Line ~450: TODO: investigate why SvPositionToWorld returns bad values when DeviceZ is far=0
-// Line 1529: TODO: investigate why we need this workaround... floating point issue with sphere intersection?
+DeviceZ = max(0.000000000001, DeviceZ);  // TODO: investigate why SvPositionToWorld returns bad values when DeviceZ is far=0 when using inverted z
+```
+
+**TODO 2:** `RenderCameraAerialPerspectiveVolumeCS()` (SkyAtmosphere.usf:1529)
+```hlsl
+if (BelowHorizon || UnderGround)
+{
+    CamPos += normalize(CamPos) * 0.02f;  // TODO: investigate why we need this workaround. Without it, we get some bad color and flickering on the ground only (floating point issue with sphere intersection code?).
+
+    float3 VoxelWorldPosNorm = normalize(VoxelWorldPos);
+    float3 CamProjOnGround = normalize(CamPos) * Atmosphere.BottomRadiusKm;
+    // ... workaround continues with horizon detection ...
+}
 ```
 
 ### Alternative Code Paths (Bypass Options)
@@ -197,6 +287,8 @@ On your sun directional light, enable:
 
 ```hlsl
 // SkyAtmosphere.usf line 509
+// In IntegrateSingleScatteredLuminance()
+
 // Replace:
 if (dot(WorldDir, TraceStartToSurfaceWorldKm) < 0.0)
 
@@ -209,7 +301,9 @@ if (dot(WorldDir, TraceStartToSurfaceWorldKm) < -0.001)  // 1 meter tolerance in
 Fixes both length precision and dot check in one change:
 
 ```hlsl
-// SkyAtmosphere.usf lines 491-515 - Full replacement for the #else block:
+// SkyAtmosphere.usf lines 491-515
+// In IntegrateSingleScatteredLuminance(), replace the #else // SAMPLE_ATMOSPHERE_ON_CLOUDS block:
+
 #else // SAMPLE_ATMOSPHERE_ON_CLOUDS
     if (DeviceZ != FarDepthValue)
     {
@@ -237,9 +331,10 @@ Fixes both length precision and dot check in one change:
 
 #### Option 3: Safer Sphere Intersection
 
-In `Common.ush` around line 1968:
-
 ```hlsl
+// Common.ush line 1968
+// In RayIntersectSphere()
+
 // Replace:
 if (Discriminant >= 0)
 
@@ -251,9 +346,10 @@ if (Discriminant >= -1e-6)  // Allow tiny negative for numerical stability
 
 #### Option 4: Use Radius Safety Margin
 
-In sphere intersection calls within `IntegrateSingleScatteredLuminance`:
-
 ```hlsl
+// SkyAtmosphere.usf around line 450
+// In IntegrateSingleScatteredLuminance(), sphere intersection calls
+
 // Add safety margin to sphere radius:
 float2 SolB = RayIntersectSphere(WorldPos, WorldDir,
     float4(PlanetO, Atmosphere.BottomRadiusKm * PLANET_RADIUS_RATIO_SAFE_EDGE));
@@ -278,12 +374,111 @@ PsPassParameters->ScreenEdgeDistance = ComputeScreenEdgeDistance(ViewRect);
 // In shader: if (ScreenEdgeDistance < 0.05) skip depth test
 ```
 
+### Option 5: Dynamic BottomRadius Based on Camera Altitude
+
+A practical workaround: lerp the `BottomRadius` between ground-accurate and space-inflated values based on camera altitude. This avoids shader modifications entirely.
+
+**Why it works:**
+- At ground level: Use true mesh radius (no blue tint)
+- At space level: Use slightly inflated radius (fixes edge artifacts)
+- Smooth transition between the two
+
+**Runtime cost:** Negligible - `SetBottomRadius()` uses state stream, just a uniform update (~microseconds/frame).
+
+#### Implementation Options
+
+**Option A: Blueprint (Recommended for prototyping)**
+
+```
+// Per-frame in PlayerController or CameraManager
+Alpha = saturate((CameraAltitudeKm - GroundAltitude) / (SpaceAltitude - GroundAltitude))
+BottomRadius = PlanetRadius + lerp(0.0, PlanetRadius * (InflationFactor - 1.0), Alpha)
+SkyAtmosphereComponent->SetBottomRadius(BottomRadius)
+```
+
+**Option B: C++ Component**
+
+```cpp
+// Attach to camera pawn, override TickComponent
+void UDynamicAtmosphereComponent::TickComponent(float DeltaTime, ...)
+{
+    const float AltitudeKm = (GetOwner()->GetActorLocation().Z * CM_TO_KM) - PlanetCenterZ;
+    const float Alpha = FMath::Clamp((AltitudeKm - GroundAltitudeKm) / (SpaceAltitudeKm - GroundAltitudeKm), 0.f, 1.f);
+    const float TargetRadius = PlanetRadiusKm * (1.0f + FMath::Lerp(0.f, InflationFactor, Alpha));
+
+    // Smooth transition to avoid popping
+    CurrentRadius = FMath::FInterpTo(CurrentRadius, TargetRadius, DeltaTime, SmoothSpeed);
+
+    if (SkyAtmosphere)
+        SkyAtmosphere->SetBottomRadius(CurrentRadius);
+}
+```
+
+**Option C: Renderer-side (Engine modification)**
+
+In `RenderSkyAtmosphere()` per-view loop:
+```cpp
+// Existing altitude calculation (from debug code)
+const float AltitudeKm = (View.ViewLocation * CM_TO_KM - Atmosphere.PlanetCenterKm).Size() - Atmosphere.BottomRadiusKm;
+const float Alpha = FMath::Clamp(AltitudeKm / TransitionAltitudeKm, 0.f, 1.f);
+const float DynamicBottomRadiusKm = FMath::Lerp(Atmosphere.BottomRadiusKm, SpaceBottomRadiusKm, Alpha);
+// Override in per-view uniform buffer
+```
+
+#### Recommended Parameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `GroundAltitude` | 0 km | Sea level |
+| `SpaceAltitude` | 100 km | Full inflation threshold |
+| `InflationFactor` | 0.005 (0.5%) | ~32 km at Earth scale |
+| `SmoothSpeed` | 2.0 | Damping for transitions |
+
+#### Lerp Formula
+
+```
+Alpha = saturate((CameraAltitudeKm - GroundAltitudeKm) / (SpaceAltitudeKm - GroundAltitudeKm))
+BottomRadius = PlanetRadius * (1.0 + InflationFactor * Alpha)
+```
+
+- At 0 km: `Alpha=0` → `BottomRadius = PlanetRadius` (exact, no blue tint)
+- At 100+ km: `Alpha=1` → `BottomRadius = PlanetRadius * 1.005` (fixes edge artifacts)
+
+#### Gotchas
+
+| Issue | Solution |
+|-------|----------|
+| Visual popping on rapid altitude change | Add damping: `FInterpTo()` with SmoothSpeed |
+| Underground camera (Alt < 0) | Clamp Alpha to 0 |
+| Multi-camera/split-screen | Compute per-viewport |
+| VR stereo mismatch | Use head position, not per-eye |
+
+#### Why NOT Shader-Only for Depth Code?
+
+Using inflated radius ONLY in the depth buffer integration (lines 491-512) causes visual inconsistency:
+- Sky gradient uses original radius
+- Planet shadows use original radius
+- Horizon scattering mismatches occlusion
+
+**Recommendation:** Apply the lerp globally via `SetBottomRadius()` or not at all.
+
+#### Alternative: Multiple SkyAtmosphere Actors
+
+```
+Alt < 10km:   GroundAtmosphereActor (precise radius, enabled)
+10-100km:     TransitionAtmosphereActor (lerped)
+100+km:       SpaceAtmosphereActor (inflated radius, enabled)
+```
+
+Toggle via `SetActorHiddenInGame()` with crossfade. Zero per-frame cost but requires careful blending.
+
 ### Recommended Fix Priority
 
-1. **Option 2 (projected distance)** - Most robust single shader change
-2. **Option 3 (safe sphere intersection)** - Defense in depth for all grazing rays
-3. **Option 4 (radius margin)** - If edge artifacts persist, adds 10m safety
-4. **Console vars** - Immediate workaround, no code changes needed
+1. **Option 5 (dynamic BottomRadius)** - No engine changes, works in Blueprint
+2. **Option 2 (projected distance)** - Most robust single shader change
+3. **Option 3 (safe sphere intersection)** - Defense in depth for all grazing rays
+4. **Option 4 (radius margin)** - If edge artifacts persist, adds 10m safety
+5. **Console vars** - Immediate workaround, no code changes needed
 
 ## Key Source Files
 

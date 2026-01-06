@@ -420,14 +420,61 @@ void UDynamicAtmosphereComponent::TickComponent(float DeltaTime, ...)
 
 **Option C: Renderer-side (Engine modification)**
 
-In `RenderSkyAtmosphere()` per-view loop:
+**File:** `Engine/Source/Runtime/Renderer/Private/SkyAtmosphereRendering.cpp`
+**Function:** `FSceneRenderer::RenderSkyAtmosphereInternal()` (starts line 1793)
+
+**Existing code block (lines 1809-1813, 1851-1852):**
 ```cpp
-// Existing altitude calculation (from debug code)
-const float AltitudeKm = (View.ViewLocation * CM_TO_KM - Atmosphere.PlanetCenterKm).Size() - Atmosphere.BottomRadiusKm;
-const float Alpha = FMath::Clamp(AltitudeKm / TransitionAltitudeKm, 0.f, 1.f);
-const float DynamicBottomRadiusKm = FMath::Lerp(Atmosphere.BottomRadiusKm, SpaceBottomRadiusKm, Alpha);
-// Override in per-view uniform buffer
+	const FVector3f ViewOrigin = (FVector3f)ViewMatrices.GetViewOrigin();
+	const FVector3f PlanetCenter = (FVector3f)Atmosphere.PlanetCenterKm * KM_TO_CM;	// LWC_TODO: Precision Loss
+	const float TopOfAtmosphere = Atmosphere.TopRadiusKm * KM_TO_CM;
+	const float PLANET_RADIUS_RATIO_SAFE_EDGE = 1.00000155763f; // must match PLANET_RADIUS_SAFE_TRACE_EDGE
+	const bool ForceRayMarching = SkyRC.bForceRayMarching || (FVector3f::Distance(ViewOrigin, PlanetCenter) >= (TopOfAtmosphere * PLANET_RADIUS_RATIO_SAFE_EDGE));
+	// ... lines 1814-1850 ...
+	FRenderSkyAtmospherePS::FParameters* PsPassParameters = GraphBuilder.AllocParameters<FRenderSkyAtmospherePS::FParameters>();
+	PsPassParameters->Atmosphere = Scene->GetSkyAtmosphereSceneInfo()->GetAtmosphereUniformBuffer();  // <-- Uses cached uniform buffer
 ```
+
+**Modified code (insert after line 1813, replace line 1852):**
+```cpp
+	const FVector3f ViewOrigin = (FVector3f)ViewMatrices.GetViewOrigin();
+	const FVector3f PlanetCenter = (FVector3f)Atmosphere.PlanetCenterKm * KM_TO_CM;
+	const float TopOfAtmosphere = Atmosphere.TopRadiusKm * KM_TO_CM;
+	const float PLANET_RADIUS_RATIO_SAFE_EDGE = 1.00000155763f;
+	const bool ForceRayMarching = SkyRC.bForceRayMarching || (FVector3f::Distance(ViewOrigin, PlanetCenter) >= (TopOfAtmosphere * PLANET_RADIUS_RATIO_SAFE_EDGE));
+
+	// === BEGIN DYNAMIC BOTTOM RADIUS ===
+	// Compute camera altitude in km
+	const float ViewAltitudeKm = (FVector3f::Distance(ViewOrigin, PlanetCenter) * CM_TO_KM) - Atmosphere.BottomRadiusKm;
+
+	// Lerp parameters (could be CVars)
+	const float GroundAltitudeKm = 0.0f;
+	const float SpaceAltitudeKm = 100.0f;
+	const float InflationFactor = 0.005f;  // 0.5% = ~32km at Earth scale
+
+	// Compute dynamic radius
+	const float Alpha = FMath::Clamp((ViewAltitudeKm - GroundAltitudeKm) / (SpaceAltitudeKm - GroundAltitudeKm), 0.f, 1.f);
+	const float DynamicBottomRadiusKm = Atmosphere.BottomRadiusKm * (1.0f + InflationFactor * Alpha);
+
+	// Create per-view atmosphere uniform buffer with modified radius
+	FAtmosphereUniformShaderParameters DynamicAtmosphereParams = *SkyInfo.GetAtmosphereShaderParameters();
+	DynamicAtmosphereParams.BottomRadiusKm = DynamicBottomRadiusKm;
+	TUniformBufferRef<FAtmosphereUniformShaderParameters> DynamicAtmosphereUniformBuffer =
+		TUniformBufferRef<FAtmosphereUniformShaderParameters>::CreateUniformBufferImmediate(DynamicAtmosphereParams, UniformBuffer_SingleFrame);
+	// === END DYNAMIC BOTTOM RADIUS ===
+
+	// ... lines 1814-1850 unchanged ...
+
+	FRenderSkyAtmospherePS::FParameters* PsPassParameters = GraphBuilder.AllocParameters<FRenderSkyAtmospherePS::FParameters>();
+	PsPassParameters->Atmosphere = DynamicAtmosphereUniformBuffer;  // <-- Use per-view buffer instead
+```
+
+**Why this location:**
+- `ViewOrigin` and `PlanetCenter` already computed (line 1809-1810)
+- Before the uniform buffer is bound (line 1852)
+- Per-view context available via `SkyRC`
+
+**Note:** The original uniform buffer is created once at scene init (line 491 in `FSkyAtmosphereRenderSceneInfo` constructor) with `UniformBuffer_MultiFrame`. This modification creates a `UniformBuffer_SingleFrame` per render pass.
 
 #### Recommended Parameters
 

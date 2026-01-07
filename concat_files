@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+
+# Script to recursively find files with specific extensions and concatenate their contents
+# Includes directory tree structure at the beginning
+# Usage: concat_files <extension1> [extension2] [extension3] ... [--dir=directory] [--lines=N]
+
+# Default to current directory and no line limit
+SEARCH_DIR="."
+MAX_LINES=0  # 0 means no limit
+EXTENSIONS=()
+
+# Process arguments
+for arg in "$@"; do
+    if [[ $arg == --dir=* ]]; then
+        SEARCH_DIR="${arg#--dir=}"
+    elif [[ $arg == --lines=* ]]; then
+        MAX_LINES="${arg#--lines=}"
+        # Validate max lines is a number
+        if ! [[ "$MAX_LINES" =~ ^[0-9]+$ ]]; then
+            echo "Error: --lines parameter must be a positive number"
+            exit 1
+        fi
+    else
+        # Add to extensions array
+        EXTENSIONS+=("$arg")
+    fi
+done
+
+# Check if at least one extension is provided
+if [ ${#EXTENSIONS[@]} -eq 0 ]; then
+    echo "Usage: concat_files <extension1> [extension2] [extension3] ... [--dir=directory] [--lines=N]"
+    echo "Example: concat_files py"
+    echo "Example with multiple extensions: concat_files cpp h"
+    echo "Example with specific directory: concat_files py --dir=./src"
+    echo "Example with line limit: concat_files py --lines=100"
+    exit 1
+fi
+
+# Check if directory exists
+if [ ! -d "$SEARCH_DIR" ]; then
+    echo "Error: Directory '$SEARCH_DIR' not found"
+    exit 1
+fi
+
+# Get directory name for the output file
+if [ "$SEARCH_DIR" = "." ]; then
+    DIR_NAME=$(basename "$(pwd)")
+else
+    DIR_NAME=$(basename "$SEARCH_DIR")
+fi
+
+# Create output filename with all extensions
+EXT_STRING=$(IFS=_ ; echo "${EXTENSIONS[*]}")
+OUTPUT_FILE="${DIR_NAME}_${EXT_STRING}_files.txt"
+
+# Add line limit indicator to filename if specified
+if [ "$MAX_LINES" -gt 0 ]; then
+    OUTPUT_FILE="${DIR_NAME}_${EXT_STRING}_${MAX_LINES}lines.txt"
+fi
+
+# Check if we have write permission for the output file
+touch "$OUTPUT_FILE" 2>/dev/null
+if [ "$?" -ne 0 ]; then
+    echo "Error: Cannot write to output file '$OUTPUT_FILE'"
+    exit 1
+fi
+
+# Clear output file if it exists
+echo "" > "$OUTPUT_FILE"
+
+# Create file pattern for find command
+FIND_PATTERN=""
+for ext in "${EXTENSIONS[@]}"; do
+    if [ -z "$FIND_PATTERN" ]; then
+        FIND_PATTERN="-name \"*.$ext\""
+    else
+        FIND_PATTERN="$FIND_PATTERN -o -name \"*.$ext\""
+    fi
+done
+
+# Count the number of matching files
+FILE_COUNT=$(eval "find \"$SEARCH_DIR\" -type f \( $FIND_PATTERN \) | wc -l")
+
+# Check if any matching files were found
+if [ "$FILE_COUNT" -eq 0 ]; then
+    echo "No files with extensions ${EXTENSIONS[*]} found in directory '$SEARCH_DIR'"
+    exit 0
+fi
+
+# Build descriptive line limit message
+if [ "$MAX_LINES" -gt 0 ]; then
+    LINE_LIMIT_MSG="(max ${MAX_LINES} lines per file)"
+else
+    LINE_LIMIT_MSG=""
+fi
+
+echo "Found $FILE_COUNT files with extensions ${EXTENSIONS[*]}. Concatenating to '$OUTPUT_FILE' $LINE_LIMIT_MSG..."
+
+# Add a header with information about the concatenation
+echo "# Concatenated files with extensions: ${EXTENSIONS[*]}" > "$OUTPUT_FILE"
+echo "# From directory: '$SEARCH_DIR'" >> "$OUTPUT_FILE"
+echo "# Created on $(date)" >> "$OUTPUT_FILE"
+echo "# Contains $FILE_COUNT files" >> "$OUTPUT_FILE"
+
+# Add line limit info if applicable
+if [ "$MAX_LINES" -gt 0 ]; then
+    echo "# Limited to maximum $MAX_LINES lines per file" >> "$OUTPUT_FILE"
+fi
+
+echo -e "# ==========================================================\n\n" >> "$OUTPUT_FILE"
+
+# Check if tree command is available
+if command -v tree &> /dev/null; then
+    echo "# Directory Structure:" >> "$OUTPUT_FILE"
+    echo "#" >> "$OUTPUT_FILE"
+    
+    # Add tree output, but only show the specified extensions
+    tree_pattern=""
+    for ext in "${EXTENSIONS[@]}"; do
+        if [ -z "$tree_pattern" ]; then
+            tree_pattern="*.$ext"
+        else
+            tree_pattern="$tree_pattern|*.$ext"
+        fi
+    done
+    
+    # Add tree output with each line prefixed by #
+    tree -P "$tree_pattern" --prune -I "node_modules" "$SEARCH_DIR" | sed 's/^/# /' >> "$OUTPUT_FILE"
+    
+    echo -e "#\n# ==========================================================\n\n" >> "$OUTPUT_FILE"
+else
+    echo "# Note: 'tree' command not available. Install it for directory structure visualization." >> "$OUTPUT_FILE"
+    echo -e "# ==========================================================\n\n" >> "$OUTPUT_FILE"
+fi
+
+# Find all files with the specified extensions and concatenate their contents
+eval "find \"$SEARCH_DIR\" -type f \( $FIND_PATTERN \)" | sort | while read -r FILE; do
+    # Add a header for each file
+    echo -e "\n\n# ==========================================" >> "$OUTPUT_FILE"
+    echo -e "# File: $FILE" >> "$OUTPUT_FILE"
+    
+    # Add line count info
+    FILE_LINE_COUNT=$(wc -l < "$FILE")
+    echo -e "# Lines: $FILE_LINE_COUNT" >> "$OUTPUT_FILE"
+    
+    # If line limit is active and file exceeds it, add a note
+    if [ "$MAX_LINES" -gt 0 ] && [ "$FILE_LINE_COUNT" -gt "$MAX_LINES" ]; then
+        echo -e "# NOTE: Showing only first $MAX_LINES of $FILE_LINE_COUNT lines" >> "$OUTPUT_FILE"
+    fi
+    
+    echo -e "# ==========================================" >> "$OUTPUT_FILE"
+    echo -e "\n" >> "$OUTPUT_FILE"
+    
+    # Add the file content, with optional line limit
+    if [ "$MAX_LINES" -gt 0 ]; then
+        head -n "$MAX_LINES" "$FILE" >> "$OUTPUT_FILE"
+        
+        # If file was truncated, add indicator
+        if [ "$FILE_LINE_COUNT" -gt "$MAX_LINES" ]; then
+            echo -e "\n# ... ($(($FILE_LINE_COUNT - $MAX_LINES)) more lines) ..." >> "$OUTPUT_FILE"
+        fi
+    else
+        cat "$FILE" >> "$OUTPUT_FILE"
+    fi
+done
+
+echo "Concatenation complete. Output written to '$OUTPUT_FILE'"
+
+# Print some stats
+TOTAL_LINES=$(wc -l < "$OUTPUT_FILE")
+TOTAL_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
+echo "Output file stats: $TOTAL_LINES lines, $TOTAL_SIZE"
+
+# If line limit was used, print additional info
+if [ "$MAX_LINES" -gt 0 ]; then
+    echo "Note: Files were limited to $MAX_LINES lines each"
+fi
